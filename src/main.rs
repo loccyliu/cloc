@@ -1,9 +1,7 @@
 mod model;
 
-use crate::model::FileInfo;
 use model::CodeFileData;
 use std::collections::HashMap;
-/// calculates the code file lines
 use std::{env, io};
 
 use chardet::detect;
@@ -11,9 +9,12 @@ use encoding::label::encoding_from_whatwg_label;
 use encoding::{DecoderTrap, Encoding};
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 fn show_version() {
-    println!("cloc 1.0.0 @2026 LOCCY");
+    println!("cloc(rust) 1.0.0 @2026 by Loccy");
 }
 fn show_help() {
     println!("\nUsage: cloc <path>");
@@ -38,7 +39,7 @@ fn show_footer() {
 
 const EXTENSIONS: &[&str] = &[
     "rs", "js", "ts", "py", "java", "c", "cpp", "h", "html", "css", "go", "rb", "php", "swift",
-    "lua", "cs", "xml", "kt","jsx","tsx","scss","less","dart","m","mm","vue"
+    "lua", "cs", "xml", "kt", "jsx", "tsx", "scss", "less", "dart", "m", "mm", "vue",
 ];
 
 fn main() {
@@ -50,19 +51,29 @@ fn main() {
     }
     let path = &args[1];
     println!("dir={}", path);
+    let time_start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis(); // 获取毫秒
 
     let mut code_files = 0;
     let mut ignore_files = 0;
 
-    let file_list: Vec<FileInfo> = read_dir(path);
+    let file_list: Vec<String> = read_dir(path);
 
     let mut code_file_list: Vec<CodeFileData> = Vec::new();
 
-    for fi in &file_list {
-        if fi.is_code_file() {
+    for f_path in &file_list {
+        // 判断文件是否是代码文件
+        let ext = Path::new(f_path)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str);
+        // 根据不同的扩展名，判断是哪种代码文件，不同的扩展名可能对应不同的编程语言，对应的注释规则也不同
+
+        let code_file_info = parse_file(f_path, ext.unwrap());
+        if let Some(cfi) = code_file_info {
+            code_file_list.push(cfi);
             code_files += 1;
-            let code_file_info = parse_file(fi.path(), fi.extension());
-            code_file_list.push(code_file_info);
         } else {
             ignore_files += 1;
         }
@@ -86,7 +97,14 @@ fn main() {
         sum.2 += cfi.comment();
         sum.3 += cfi.code();
     }
+    let time_end = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis(); // 获取毫秒
+    let time_used = time_end - time_start;
 
+    println!();
+    println!("Time used: {time_used} ms");
     println!("{:>10} code files", code_files);
     println!("{:>10} files ignored", ignore_files);
 
@@ -116,74 +134,210 @@ fn main() {
     show_footer();
 }
 
-fn read_dir(path: &str) -> Vec<FileInfo> {
-    let mut file_list: Vec<FileInfo> = Vec::new();
+fn read_dir(path: &str) -> Vec<String> {
+    let mut file_list: Vec<String> = Vec::new();
 
-    let entries = std::fs::read_dir(path).unwrap();
-
-    for entry in entries {
-        if let Ok(dir_enter) = entry {
-            let path = dir_enter.path();
-            let path_str = path.to_str().unwrap();
-            if path.is_dir() {
-                let list = read_dir(path_str);
-                for fi in list {
-                    file_list.push(fi);
-                }
-            } else {
-                let ext = path.extension().and_then(std::ffi::OsStr::to_str);
-                if let Some(ext) = ext {
-                    let is_code_file = EXTENSIONS.contains(&ext);
-                    let fi = FileInfo::new(String::from(path_str), String::from(ext), is_code_file);
-                    file_list.push(fi);
-                }
+    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            if let Some(path_str) = entry.path().to_str() {
+                file_list.push(String::from(path_str));
             }
         }
     }
-
     file_list
 }
 
-fn parse_file(path: &str, ext: &str) -> CodeFileData {
-    let mut fi = CodeFileData::new(String::from(path), String::from(ext));
+fn parse_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    match ext {
+        "c" | "cpp" | "h" | "rs" | "java" | "go" | "swift" | "cs" | "m" | "mm" | "kt" | "js"
+        | "ts" | "jsx" | "tsx" | "dart" => parse_code_file(path, ext),
+        "py" => parse_python_file(path, ext),
+        "lua" => parse_lua_file(path, ext),
+        "html" | "htm" | "xml" => parse_xml_file(path, ext),
+        "css" | "scss" | "less" => parse_css_file(path, ext),
+        _ => None,
+    }
+}
 
-    // let content = std::fs::read_to_string(path).unwrap();
+// 使用//和/* */注释规则
+fn parse_code_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
     let result = read_non_utf8_lines(path);
-    match result {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            fi.set_lines(lines.len() as u64);
+    if let Ok(content) = &result {
+        let lines: Vec<&str> = content.lines().collect();
+        cfd.set_lines(lines.len() as u64);
 
-            let mut is_comment_wrap = false;
-            for line in lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    fi.add_blank();
-                } else {
-                    if trimmed.starts_with("//") {
-                        fi.add_comment();
-                    } else if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
-                        fi.add_comment();
-                    } else if trimmed.starts_with("/*") {
-                        fi.add_comment();
-                        is_comment_wrap = true;
-                    } else if is_comment_wrap {
-                        fi.add_comment();
-                        if trimmed.ends_with("*/") {
-                            is_comment_wrap = false;
-                        }
-                    } else {
-                        fi.add_code();
+        let mut is_comment_wrap = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+            } else {
+                if trimmed.starts_with("//") && !is_comment_wrap {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("/*") {
+                    cfd.add_comment();
+                    is_comment_wrap = true;
+                } else if is_comment_wrap {
+                    cfd.add_comment();
+                    if trimmed.ends_with("*/") {
+                        is_comment_wrap = false;
                     }
+                } else {
+                    cfd.add_code();
                 }
             }
         }
-        Err(_) => {}
+        Some(cfd)
+    } else {
+        None
     }
+}
 
+// python 使用#和""" """注释规则
+fn parse_python_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path);
+    if let Ok(content) = &result {
+        let lines: Vec<&str> = content.lines().collect();
+        cfd.set_lines(lines.len() as u64);
 
+        let mut is_comment_wrap = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+            } else {
+                if trimmed.starts_with("#") && !is_comment_wrap {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("\"\"\"") && trimmed.ends_with("\"\"\"") {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("\"\"\"") {
+                    cfd.add_comment();
+                    is_comment_wrap = true;
+                } else if is_comment_wrap {
+                    cfd.add_comment();
+                    if trimmed.ends_with("\"\"\"") {
+                        is_comment_wrap = false;
+                    }
+                } else {
+                    cfd.add_code();
+                }
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
 
-    fi
+// lua 使用--和--[[ ]]注释规则
+fn parse_lua_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path);
+    if let Ok(content) = &result {
+        let lines: Vec<&str> = content.lines().collect();
+        cfd.set_lines(lines.len() as u64);
+
+        let mut is_comment_wrap = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+            } else {
+                if trimmed.starts_with("--") && !is_comment_wrap {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("--[[") && trimmed.ends_with("]]") {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("--[[") {
+                    cfd.add_comment();
+                    is_comment_wrap = true;
+                } else if is_comment_wrap {
+                    cfd.add_comment();
+                    if trimmed.ends_with("]]") {
+                        is_comment_wrap = false;
+                    }
+                } else {
+                    cfd.add_code();
+                }
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// xml、html 使用<!-- -->注释规则
+fn parse_xml_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path);
+    if let Ok(content) = &result {
+        let lines: Vec<&str> = content.lines().collect();
+        cfd.set_lines(lines.len() as u64);
+
+        let mut is_comment_wrap = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+            } else {
+                if trimmed.starts_with("<!--") && trimmed.ends_with("-->") {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("<!--") {
+                    cfd.add_comment();
+                    is_comment_wrap = true;
+                } else if is_comment_wrap {
+                    cfd.add_comment();
+                    if trimmed.ends_with("-->") {
+                        is_comment_wrap = false;
+                    }
+                } else {
+                    cfd.add_code();
+                }
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// css, 使用/* */注释规则
+fn parse_css_file(path: &str, ext: &str) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path);
+    if let Ok(content) = &result {
+        let lines: Vec<&str> = content.lines().collect();
+        cfd.set_lines(lines.len() as u64);
+
+        let mut is_comment_wrap = false;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+            } else {
+                if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
+                    cfd.add_comment();
+                } else if trimmed.starts_with("/*") {
+                    cfd.add_comment();
+                    is_comment_wrap = true;
+                } else if is_comment_wrap {
+                    cfd.add_comment();
+                    if trimmed.ends_with("*/") {
+                        is_comment_wrap = false;
+                    }
+                } else {
+                    cfd.add_code();
+                }
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
 }
 
 fn read_non_utf8_lines(path: &str) -> io::Result<String> {
@@ -205,5 +359,5 @@ fn read_non_utf8_lines(path: &str) -> io::Result<String> {
             }
         }
     }
-     Err(io::Error::new(ErrorKind::NotFound, "无法识别的编码") )
+    Err(io::Error::new(ErrorKind::NotFound, "无法识别的编码"))
 }

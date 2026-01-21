@@ -1,37 +1,38 @@
 //! 数据结构体
-
-pub enum ExtType {
-    JS,
-    Other,
-}
-
-pub struct FileInfo {
-    path: String,
-    extension: String,
-    is_code_file: bool,
-}
-
-impl FileInfo {
-    pub fn new(path: String, extension: String, is_code_file: bool) -> FileInfo {
-        FileInfo {
-            path,
-            extension,
-            is_code_file,
-        }
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn extension(&self) -> &str {
-        &self.extension
-    }
-
-    pub fn is_code_file(&self) -> bool {
-        self.is_code_file
-    }
-}
+//
+// pub enum FileType {
+//     Code{etx: String, name: String},
+//     Makefile,
+//     Other
+// }
+//
+// pub struct FileInfo {
+//     path: String,
+//     extension: String,
+//     is_code_file: bool,
+// }
+//
+// impl FileInfo {
+//     pub fn new(path: String, extension: String, is_code_file: bool) -> FileInfo {
+//         FileInfo {
+//             path,
+//             extension,
+//             is_code_file,
+//         }
+//     }
+//
+//     pub fn path(&self) -> &str {
+//         &self.path
+//     }
+//
+//     pub fn extension(&self) -> &str {
+//         &self.extension
+//     }
+//
+//     pub fn is_code_file(&self) -> bool {
+//         self.is_code_file
+//     }
+// }
 
 pub struct CodeFileData {
     path: String,
