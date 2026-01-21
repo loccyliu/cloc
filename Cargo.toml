@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 encoding = "0.2.33"
 chardet = "0.2.4"
+walkdir = "2.3.3"
+rayon = "1.10.0"

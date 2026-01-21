@@ -1,23 +1,58 @@
-mod model;
-
-use crate::model::FileInfo;
-use model::CodeFileData;
 use std::collections::HashMap;
-/// calculates the code file lines
 use std::{env, io};
 
 use chardet::detect;
+use encoding::DecoderTrap;
 use encoding::label::encoding_from_whatwg_label;
-use encoding::{DecoderTrap, Encoding};
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read};
+use std::path::Path;
+use std::time::Instant;
+use walkdir::WalkDir;
+
+mod model;
+
+use model::{CliOptions, CodeFileData, ParserKind};
+
+mod comment_parser;
+use crate::comment_parser::{
+    LuaState, ParseState, PythonState, classify_line_c_like, classify_line_css_like,
+    classify_line_lua_like, classify_line_python_like, classify_line_xml_like,
+};
+
+const APP_NAME: &str = "cloc";
+const APP_VERSION: &str = "1.0.0";
 
 fn show_version() {
-    println!("cloc 1.0.0 @2026 LOCCY");
+    println!("{APP_NAME}(rust) {APP_VERSION} @2026 by Loccy");
 }
+
 fn show_help() {
-    println!("\nUsage: cloc <path>");
+    println!(
+        r#"用法:
+  cloc [options] [path]
+
+Arguments:
+  path                扫描目录 (默认当前目录)
+
+Options:
+  -h, --help          显示帮助信息
+  -V, --version       显示版本信息
+  --no-parallel       禁用并行解析(rayon)
+  --max-bytes <N>     跳过大文件，默认16M(16777216字节)
+  --no-binary-skip    不跳过疑似二进制文件
+  --exclude-dir <N>   排除目录， 默认排除目录(.git, target, node_modules)
+
+示例:
+  cloc .
+  cloc --exclude-dir target --exclude-dir .git .
+  cloc --no-parallel D:\\repo
+  cloc --max-bytes 1048576 .
+"#
+    );
 }
+
 fn show_header() {
     println!("-------------------------------------------------------------------------------");
     println!(
@@ -32,44 +67,196 @@ fn show_header() {
     println!("-------------------------------------------------------------------------------");
 }
 
-fn show_footer() {
+fn show_dash_line() {
     println!("-------------------------------------------------------------------------------");
 }
 
-const EXTENSIONS: &[&str] = &[
-    "rs", "js", "ts", "py", "java", "c", "cpp", "h", "html", "css", "go", "rb", "php", "swift",
-    "lua", "cs", "xml", "kt","jsx","tsx","scss","less","dart","m","mm","vue"
+/// Single source of truth for:
+/// - which extensions are supported
+/// - which parser to use
+///
+/// To add a new file type, add one entry here.
+const PATTERNS: &[(&str, ParserKind)] = &[
+    // C-like
+    ("c", ParserKind::CLike),
+    ("cpp", ParserKind::CLike),
+    ("h", ParserKind::CLike),
+    ("rs", ParserKind::CLike),
+    ("java", ParserKind::CLike),
+    ("go", ParserKind::CLike),
+    ("swift", ParserKind::CLike),
+    ("cs", ParserKind::CLike),
+    ("m", ParserKind::CLike),
+    ("mm", ParserKind::CLike),
+    ("kt", ParserKind::CLike),
+    ("js", ParserKind::CLike),
+    ("ts", ParserKind::CLike),
+    ("jsx", ParserKind::CLike),
+    ("tsx", ParserKind::CLike),
+    ("dart", ParserKind::CLike),
+    // Python / Lua
+    ("py", ParserKind::Python),
+    ("lua", ParserKind::Lua),
+    // Markup
+    ("html", ParserKind::Xml),
+    ("htm", ParserKind::Xml),
+    ("xml", ParserKind::Xml),
+    // Styles
+    ("css", ParserKind::Css),
+    ("scss", ParserKind::Css),
+    ("less", ParserKind::Css),
 ];
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+fn parser_for_ext(ext: &str) -> Option<ParserKind> {
+    // Linear scan is fine here; extensions list is tiny.
+    PATTERNS.iter().find(|(e, _)| *e == ext).map(|(_, k)| *k)
+}
 
-    if args.len() < 2 {
-        show_help();
-        return;
-    }
-    let path = &args[1];
-    println!("dir={}", path);
+fn parse_args() -> Result<CliOptions, String> {
+    let mut opts = CliOptions::default();
 
-    let mut code_files = 0;
-    let mut ignore_files = 0;
-
-    let file_list: Vec<FileInfo> = read_dir(path);
-
-    let mut code_file_list: Vec<CodeFileData> = Vec::new();
-
-    for fi in &file_list {
-        if fi.is_code_file() {
-            code_files += 1;
-            let code_file_info = parse_file(fi.path(), fi.extension());
-            code_file_list.push(code_file_info);
-        } else {
-            ignore_files += 1;
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                show_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                show_version();
+                std::process::exit(0);
+            }
+            "--no-parallel" => {
+                opts.parallel = false;
+            }
+            "--no-binary-skip" => {
+                opts.binary_skip = false;
+            }
+            "--exclude-dir" => {
+                let Some(v) = args.next() else {
+                    return Err("--exclude-dir requires a value".to_string());
+                };
+                // allow user to add more excludes on top of defaults
+                opts.exclude_dirs.push(v);
+            }
+            "--max-bytes" => {
+                let Some(v) = args.next() else {
+                    return Err("--max-bytes requires a value".to_string());
+                };
+                opts.max_bytes = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --max-bytes value: {v}"))?;
+            }
+            _ => {
+                if arg.starts_with('-') {
+                    return Err(format!("unknown option: {arg}"));
+                }
+                // positional path (first one wins)
+                opts.path = arg;
+            }
         }
     }
 
-    let mut map: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+    Ok(opts)
+}
 
+fn main() {
+    let opts = match parse_args() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}\n");
+            show_help();
+            std::process::exit(2);
+        }
+    };
+
+    let path = opts.path.as_str();
+
+    // 用单调时钟计时，避免系统时间跳变导致误差
+    let time_start = Instant::now();
+
+    // 1) 串行扫描目录，只做轻量过滤（不读文件内容）
+    let mut ignore_files: u64 = 0;
+    let mut candidates: Vec<(String, String)> = Vec::new();
+
+    // Build a lowercased exclude set for fast checks (case-insensitive on Windows).
+    let exclude_dirs: Vec<String> = opts
+        .exclude_dirs
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| {
+            // Always keep root.
+            if e.depth() == 0 {
+                return true;
+            }
+            // Skip excluded directories.
+            if e.file_type().is_dir() {
+                if let Some(name) = e.file_name().to_str() {
+                    let name_lc = name.to_ascii_lowercase();
+                    return !exclude_dirs.iter().any(|x| x == &name_lc);
+                }
+            }
+            true
+        })
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let Some(f_path) = entry.path().to_str() else {
+            ignore_files += 1;
+            continue;
+        };
+
+        let ext_opt = Path::new(f_path)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(|s| s.to_ascii_lowercase());
+
+        let Some(ext) = ext_opt else {
+            ignore_files += 1;
+            continue;
+        };
+
+        // Single source of truth: decide parser from extension.
+        let Some(_kind) = parser_for_ext(ext.as_str()) else {
+            ignore_files += 1;
+            continue;
+        };
+
+        candidates.push((f_path.to_owned(), ext));
+    }
+
+    // 2) 解析文件：可并行/可串行
+    let parsed: Vec<Option<CodeFileData>> = if opts.parallel {
+        candidates
+            .par_iter()
+            .map(|(p, ext)| parse_file(p.as_str(), ext.as_str(), &opts))
+            .collect()
+    } else {
+        candidates
+            .iter()
+            .map(|(p, ext)| parse_file(p.as_str(), ext.as_str(), &opts))
+            .collect()
+    };
+
+    // 3) 合并结果
+    let mut code_file_list: Vec<CodeFileData> = Vec::new();
+    for item in parsed {
+        match item {
+            Some(cfd) => code_file_list.push(cfd),
+            None => ignore_files += 1,
+        }
+    }
+
+    let code_files = code_file_list.len() as u64;
+
+    let mut map: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
     let mut sum: (u64, u64, u64, u64) = (0, 0, 0, 0);
 
     for cfi in &code_file_list {
@@ -87,12 +274,21 @@ fn main() {
         sum.3 += cfi.code();
     }
 
+    let time_used = time_start.elapsed().as_millis();
+
+    println!();
+    println!("Time used: {time_used} ms");
     println!("{:>10} code files", code_files);
     println!("{:>10} files ignored", ignore_files);
+    println!();
 
     show_version();
     show_header();
-    for (key, value) in map.iter() {
+
+    // Print in alphabetical order by language
+    let mut rows: Vec<(&String, &(u64, u64, u64, u64))> = map.iter().collect();
+    rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (key, value) in rows {
         println!(
             "{:<W$} {:>W$} {:>W$} {:>W$} {:>W$}",
             key,
@@ -103,7 +299,8 @@ fn main() {
             W = 15
         );
     }
-    show_footer();
+
+    show_dash_line();
     println!(
         "{:<W$} {:>W$} {:>W$} {:>W$} {:>W$}",
         "SUM",
@@ -113,97 +310,220 @@ fn main() {
         sum.3,
         W = 15
     );
-    show_footer();
+    show_dash_line();
 }
 
-fn read_dir(path: &str) -> Vec<FileInfo> {
-    let mut file_list: Vec<FileInfo> = Vec::new();
+fn parse_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let kind = parser_for_ext(ext)?;
 
-    let entries = std::fs::read_dir(path).unwrap();
+    // Read & parse file (respect CLI options)
+    match kind {
+        ParserKind::CLike => parse_code_file(path, ext, opts),
+        ParserKind::Python => parse_python_file(path, ext, opts),
+        ParserKind::Lua => parse_lua_file(path, ext, opts),
+        ParserKind::Xml => parse_xml_file(path, ext, opts),
+        ParserKind::Css => parse_css_file(path, ext, opts),
+    }
+}
 
-    for entry in entries {
-        if let Ok(dir_enter) = entry {
-            let path = dir_enter.path();
-            let path_str = path.to_str().unwrap();
-            if path.is_dir() {
-                let list = read_dir(path_str);
-                for fi in list {
-                    file_list.push(fi);
-                }
-            } else {
-                let ext = path.extension().and_then(std::ffi::OsStr::to_str);
-                if let Some(ext) = ext {
-                    let is_code_file = EXTENSIONS.contains(&ext);
-                    let fi = FileInfo::new(String::from(path_str), String::from(ext), is_code_file);
-                    file_list.push(fi);
-                }
+// 使用//和/* */注释规则
+fn parse_code_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        let mut state = ParseState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_c_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+
+            // In rare cases, a non-empty line might be neither code nor comment (shouldn't happen);
+            // treat it as code to avoid losing counts.
+            if !saw_code && !saw_comment {
+                cfd.add_code();
             }
         }
+        Some(cfd)
+    } else {
+        None
     }
-
-    file_list
 }
 
-fn parse_file(path: &str, ext: &str) -> CodeFileData {
-    let mut fi = CodeFileData::new(String::from(path), String::from(ext));
+// python 使用#和""" """注释规则
+fn parse_python_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
 
-    // let content = std::fs::read_to_string(path).unwrap();
-    let result = read_non_utf8_lines(path);
-    match result {
-        Ok(content) => {
-            let lines: Vec<&str> = content.lines().collect();
-            fi.set_lines(lines.len() as u64);
+        let mut state = PythonState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
 
-            let mut is_comment_wrap = false;
-            for line in lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    fi.add_blank();
-                } else {
-                    if trimmed.starts_with("//") {
-                        fi.add_comment();
-                    } else if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
-                        fi.add_comment();
-                    } else if trimmed.starts_with("/*") {
-                        fi.add_comment();
-                        is_comment_wrap = true;
-                    } else if is_comment_wrap {
-                        fi.add_comment();
-                        if trimmed.ends_with("*/") {
-                            is_comment_wrap = false;
-                        }
-                    } else {
-                        fi.add_code();
-                    }
-                }
+            let (saw_code, saw_comment) = classify_line_python_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
             }
         }
-        Err(_) => {}
+        Some(cfd)
+    } else {
+        None
     }
-
-
-
-    fi
 }
 
-fn read_non_utf8_lines(path: &str) -> io::Result<String> {
+// lua 使用--和--[[ ]]注释规则
+fn parse_lua_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        let mut state = LuaState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_lua_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// xml、html 使用<!-- -->注释规则
+fn parse_xml_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        let mut state = ParseState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_xml_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// css, 使用/* */注释规则
+fn parse_css_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        let mut state = ParseState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_css_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+fn read_non_utf8_lines(path: &str, max_bytes: u64, binary_skip: bool) -> io::Result<String> {
     let file = File::open(path)?;
+
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > max_bytes {
+            return Err(io::Error::new(ErrorKind::InvalidData, "文件过大，已跳过"));
+        }
+    }
+
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
-    // 自动检测编码
-    let charset = detect(&buf);
-    let enc_label = charset.0; // 返回类似 "GB18030", "SHIFT_JIS" 
-    // println!("检测到编码: {}", enc_label);
-    if let Some(enc) = encoding_from_whatwg_label(enc_label.as_str()) {
-        match enc.decode(&buf, DecoderTrap::Replace) {
-            Ok(content) => {
-                return Ok(content);
-            }
-            Err(_) => {
-                eprintln!("解码失败");
-            }
+
+    if binary_skip {
+        // Heuristic: skip likely-binary files early (NUL byte is a strong signal).
+        if buf.iter().take(8192).any(|&b| b == 0) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "疑似二进制文件，已跳过",
+            ));
         }
     }
-     Err(io::Error::new(ErrorKind::NotFound, "无法识别的编码") )
+
+    if let Ok(s) = std::str::from_utf8(&buf) {
+        return Ok(s.to_owned());
+    }
+
+    let charset = detect(&buf);
+    let enc_label = charset.0;
+    if let Some(enc) = encoding_from_whatwg_label(enc_label.as_str()) {
+        match enc.decode(&buf, DecoderTrap::Replace) {
+            Ok(content) => return Ok(content),
+            Err(_) => eprintln!("解码失败: {}", path),
+        }
+    }
+
+    Err(io::Error::new(ErrorKind::InvalidData, "无法识别的编码"))
 }
