@@ -1,0 +1,8 @@
+[package]
+name = "cloc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+encoding = "0.2.33"
+chardet = "0.2.4"
