@@ -81,6 +81,7 @@ fn show_dash_line() {
 const PATTERNS: &[(&str, ParserKind)] = &[
     // C-like
     ("c", ParserKind::CLike),
+    ("cc", ParserKind::CLike),
     ("cpp", ParserKind::CLike),
     ("h", ParserKind::CLike),
     ("rs", ParserKind::CLike),
@@ -116,12 +117,14 @@ const PATTERNS: &[(&str, ParserKind)] = &[
     ("html", ParserKind::Xml),
     ("htm", ParserKind::Xml),
     ("xml", ParserKind::Xml),
+    ("wxml", ParserKind::Xml),
     ("md", ParserKind::Xml),
 
     // Styles
     ("css", ParserKind::Css),
     ("scss", ParserKind::Css),
     ("less", ParserKind::Css),
+    ("wxss", ParserKind::Css),
 
     // Windows scripts
     ("bat", ParserKind::Batch),
@@ -132,6 +135,7 @@ const PATTERNS: &[(&str, ParserKind)] = &[
 
     // Plain text (no comments)
     ("txt", ParserKind::PlainText),
+    ("log", ParserKind::PlainText),
 
     // SQL
     ("sql", ParserKind::Sql),
@@ -359,251 +363,151 @@ fn parse_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> 
     }
 }
 
-// 使用//和/* */注释规则
-fn parse_code_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+// ------------------------
+// Generic parsing helpers
+// ------------------------
+
+fn parse_with_state<S>(
+    path: &str,
+    ext: &str,
+    opts: &CliOptions,
+    mut state: S,
+    mut classify: impl FnMut(&str, &mut S) -> (bool, bool),
+) -> Option<CodeFileData> {
     let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
     let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
+    let Ok(content) = result else {
+        return None;
+    };
 
-        let mut state = ParseState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
+    cfd.set_lines(content.lines().count() as u64);
 
-            let (saw_code, saw_comment) = classify_line_c_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-
-            // In rare cases, a non-empty line might be neither code nor comment (shouldn't happen);
-            // treat it as code to avoid losing counts.
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            cfd.add_blank();
+            continue;
         }
-        Some(cfd)
-    } else {
-        None
+
+        let (saw_code, saw_comment) = classify(line, &mut state);
+        if saw_comment {
+            cfd.add_comment();
+        }
+        if saw_code {
+            cfd.add_code();
+        }
+        if !saw_code && !saw_comment {
+            cfd.add_code();
+        }
     }
+
+    Some(cfd)
+}
+
+fn parse_no_state(
+    path: &str,
+    ext: &str,
+    opts: &CliOptions,
+    mut classify: impl FnMut(&str) -> (bool, bool),
+) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    let Ok(content) = result else {
+        return None;
+    };
+
+    cfd.set_lines(content.lines().count() as u64);
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            cfd.add_blank();
+            continue;
+        }
+
+        let (saw_code, saw_comment) = classify(line);
+        if saw_comment {
+            cfd.add_comment();
+        }
+        if saw_code {
+            cfd.add_code();
+        }
+        if !saw_code && !saw_comment {
+            cfd.add_code();
+        }
+    }
+
+    Some(cfd)
+}
+
+fn parse_plain_text_file_shared(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    let Ok(content) = result else {
+        return None;
+    };
+
+    cfd.set_lines(content.lines().count() as u64);
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            cfd.add_blank();
+        } else {
+            cfd.add_code();
+        }
+    }
+
+    Some(cfd)
+}
+
+// 使用//和/* */注释规则
+fn parse_code_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    parse_with_state(path, ext, opts, ParseState::new(), |line, state| {
+        classify_line_c_like(line, state)
+    })
 }
 
 // python 使用#和""" """注释规则
 fn parse_python_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        let mut state = PythonState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_python_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_with_state(path, ext, opts, PythonState::new(), |line, state| {
+        classify_line_python_like(line, state)
+    })
 }
 
 // lua 使用--和--[[ ]]注释规则
 fn parse_lua_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        let mut state = LuaState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_lua_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_with_state(path, ext, opts, LuaState::new(), |line, state| {
+        classify_line_lua_like(line, state)
+    })
 }
 
 // xml、html 使用<!-- -->注释规则
 fn parse_xml_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        let mut state = ParseState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_xml_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_with_state(path, ext, opts, ParseState::new(), |line, state| {
+        classify_line_xml_like(line, state)
+    })
 }
 
 // css, 使用/* */注释规则
 fn parse_css_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        let mut state = ParseState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_css_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_with_state(path, ext, opts, ParseState::new(), |line, state| {
+        classify_line_css_like(line, state)
+    })
 }
 
 // windows batch/cmd: comment line via REM / ::
 fn parse_batch_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_batch_like(line);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_no_state(path, ext, opts, |line| classify_line_batch_like(line))
 }
 
 // plain text: do not parse comments; just count blanks and non-empty as code
 fn parse_plain_text_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                cfd.add_blank();
-            } else {
-                // treat any non-empty line as code
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_plain_text_file_shared(path, ext, opts)
 }
 
 // sql: supports `--` line comments, and `/* */` block comments
 fn parse_sql_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
-    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
-    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
-    if let Ok(content) = &result {
-        cfd.set_lines(content.lines().count() as u64);
-
-        let mut state = ParseState::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                cfd.add_blank();
-                continue;
-            }
-
-            let (saw_code, saw_comment) = classify_line_sql_like(line, &mut state);
-            if saw_comment {
-                cfd.add_comment();
-            }
-            if saw_code {
-                cfd.add_code();
-            }
-            if !saw_code && !saw_comment {
-                cfd.add_code();
-            }
-        }
-        Some(cfd)
-    } else {
-        None
-    }
+    parse_with_state(path, ext, opts, ParseState::new(), |line, state| {
+        classify_line_sql_like(line, state)
+    })
 }
 
 fn read_non_utf8_lines(path: &str, max_bytes: u64, binary_skip: bool) -> io::Result<String> {
