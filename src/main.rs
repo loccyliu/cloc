@@ -17,8 +17,10 @@ use model::{CliOptions, CodeFileData, ParserKind};
 
 mod comment_parser;
 use crate::comment_parser::{
-    LuaState, ParseState, PythonState, classify_line_c_like, classify_line_css_like,
+    LuaState, ParseState, PythonState,
+    classify_line_batch_like, classify_line_c_like, classify_line_css_like,
     classify_line_lua_like, classify_line_python_like, classify_line_xml_like,
+    classify_line_sql_like,
 };
 
 const APP_NAME: &str = "cloc";
@@ -94,17 +96,45 @@ const PATTERNS: &[(&str, ParserKind)] = &[
     ("jsx", ParserKind::CLike),
     ("tsx", ParserKind::CLike),
     ("dart", ParserKind::CLike),
-    // Python / Lua
+    // Build / config that are mostly C-like
+    ("gradle", ParserKind::CLike),
+    // NOTE: json is treated as jsonc (supports // and /* */) for practicality.
+    ("json", ParserKind::CLike),
+
+    // Hash-comment based (reuse Python-like '#', with basic string awareness)
     ("py", ParserKind::Python),
+    ("sh", ParserKind::Python),
+    ("bash", ParserKind::Python),
+    ("toml", ParserKind::Python),
+    ("yml", ParserKind::Python),
+    ("yaml", ParserKind::Python),
+
+    // Lua
     ("lua", ParserKind::Lua),
-    // Markup
+
+    // Markup / docs with <!-- -->
     ("html", ParserKind::Xml),
     ("htm", ParserKind::Xml),
     ("xml", ParserKind::Xml),
+    ("md", ParserKind::Xml),
+
     // Styles
     ("css", ParserKind::Css),
     ("scss", ParserKind::Css),
     ("less", ParserKind::Css),
+
+    // Windows scripts
+    ("bat", ParserKind::Batch),
+    ("cmd", ParserKind::Batch),
+
+    // Kotlin script
+    ("kts", ParserKind::CLike),
+
+    // Plain text (no comments)
+    ("txt", ParserKind::PlainText),
+
+    // SQL
+    ("sql", ParserKind::Sql),
 ];
 
 fn parser_for_ext(ext: &str) -> Option<ParserKind> {
@@ -323,6 +353,9 @@ fn parse_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> 
         ParserKind::Lua => parse_lua_file(path, ext, opts),
         ParserKind::Xml => parse_xml_file(path, ext, opts),
         ParserKind::Css => parse_css_file(path, ext, opts),
+        ParserKind::Batch => parse_batch_file(path, ext, opts),
+        ParserKind::PlainText => parse_plain_text_file(path, ext, opts),
+        ParserKind::Sql => parse_sql_file(path, ext, opts),
     }
 }
 
@@ -473,6 +506,90 @@ fn parse_css_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileDa
             }
 
             let (saw_code, saw_comment) = classify_line_css_like(line, &mut state);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// windows batch/cmd: comment line via REM / ::
+fn parse_batch_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_batch_like(line);
+            if saw_comment {
+                cfd.add_comment();
+            }
+            if saw_code {
+                cfd.add_code();
+            }
+            if !saw_code && !saw_comment {
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// plain text: do not parse comments; just count blanks and non-empty as code
+fn parse_plain_text_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                cfd.add_blank();
+            } else {
+                // treat any non-empty line as code
+                cfd.add_code();
+            }
+        }
+        Some(cfd)
+    } else {
+        None
+    }
+}
+
+// sql: supports `--` line comments, and `/* */` block comments
+fn parse_sql_file(path: &str, ext: &str, opts: &CliOptions) -> Option<CodeFileData> {
+    let mut cfd = CodeFileData::new(String::from(path), String::from(ext));
+    let result = read_non_utf8_lines(path, opts.max_bytes, opts.binary_skip);
+    if let Ok(content) = &result {
+        cfd.set_lines(content.lines().count() as u64);
+
+        let mut state = ParseState::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                cfd.add_blank();
+                continue;
+            }
+
+            let (saw_code, saw_comment) = classify_line_sql_like(line, &mut state);
             if saw_comment {
                 cfd.add_comment();
             }

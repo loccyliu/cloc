@@ -8,6 +8,12 @@ pub enum ParserKind {
     Lua,
     Xml,
     Css,
+    /// Windows batch scripts: line comments via leading `REM` or `::`.
+    Batch,
+    /// Plain text: no comment syntax; non-empty lines are counted as code.
+    PlainText,
+    /// SQL files: line comments via `--`, block comments via `/* */`.
+    Sql,
 }
 
 

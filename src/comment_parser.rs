@@ -585,3 +585,141 @@ fn classify_line_lua_line_comment(line: &str) -> (bool, bool) {
     (saw_code, saw_comment)
 }
 
+/// Batch/CMD-like:
+/// - comment line: leading `REM` (case-insensitive) or leading `::`
+///
+/// This is a best-effort heuristic used for cloc-style counting.
+pub fn classify_line_batch_like(line: &str) -> (bool, bool) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return (false, false);
+    }
+
+    // `::` comment (common batch trick). Only treat it as comment when it appears at start.
+    if trimmed.starts_with("::") {
+        return (false, true);
+    }
+
+    // `REM` comment. Only treat it as comment when it appears at start and is a whole word.
+    // Accept: REM, REM<space>, REM\t...
+    // Reject: REMARK, REM1, echo REM ... (since it's not at line start after trim).
+    let t = trimmed;
+    if t.len() >= 3 {
+        let prefix = &t[..3];
+        if prefix.eq_ignore_ascii_case("rem") {
+            let rest = &t[3..];
+            if rest.is_empty() {
+                return (false, true);
+            }
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_whitespace())
+            {
+                return (false, true);
+            }
+        }
+    }
+
+    (true, false)
+}
+
+/// SQL-like:
+/// - line comment: `--`
+/// - block comment: `/* */`
+/// - string literals: single and double quotes
+pub fn classify_line_sql_like(line: &str, state: &mut ParseState) -> (bool, bool) {
+    classify_line_sql_generic(line, state)
+}
+
+fn classify_line_sql_generic(line: &str, state: &mut ParseState) -> (bool, bool) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return (false, false);
+    }
+
+    let mut saw_code = false;
+    let mut saw_comment = false;
+
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+
+    let mut in_string_single = false;
+    let mut in_string_double = false;
+
+    while i < bytes.len() {
+        if state.in_block_comment {
+            if match_at(bytes, i, b"*/").is_some() {
+                state.in_block_comment = false;
+                saw_comment = true;
+                i += 2;
+                continue;
+            }
+            saw_comment = true;
+            i += 1;
+            continue;
+        }
+
+        // strings (best-effort)
+        let b = bytes[i];
+        if in_string_single {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'\'' {
+                in_string_single = false;
+            }
+            saw_code = true;
+            i += 1;
+            continue;
+        }
+
+        if in_string_double {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string_double = false;
+            }
+            saw_code = true;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\'' {
+            in_string_single = true;
+            saw_code = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string_double = true;
+            saw_code = true;
+            i += 1;
+            continue;
+        }
+
+        // block comment start
+        if match_at(bytes, i, b"/*").is_some() {
+            state.in_block_comment = true;
+            saw_comment = true;
+            i += 2;
+            continue;
+        }
+
+        // line comment start
+        if match_at(bytes, i, b"--").is_some() {
+            saw_comment = true;
+            break;
+        }
+
+        if !b.is_ascii_whitespace() {
+            saw_code = true;
+        }
+        i += 1;
+    }
+
+    (saw_code, saw_comment)
+}
